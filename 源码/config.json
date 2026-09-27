@@ -1,0 +1,32 @@
+{
+    "field_map": {},
+    "enabled_exams": ["cet4", "cet6", "ky", "ielts", "toefl", "gre"],
+    "enabled_levels": ["n5", "n4", "n3", "n2", "n1"],
+    "language": "en",
+    "count_unit": "unique_lemma",
+    "source_dimension": "deck",
+    "allow_duplicate_source": false,
+    "state_rule": "highest_progress",
+    "lemma_merge": true,
+    "show_uncovered": true,
+    "cache_enabled": true,
+    "update_check": true,
+    "materials_source": "",
+    "materials_sha256": "",
+    "materials_installed_at": 0,
+    "builder_defaults": {
+        "limit": 500,
+        "new_per_day": 0,
+        "add_tags": true
+    },
+    "scope": {
+        "deck_ids": [],
+        "include_subdecks": true,
+        "tags_include": [],
+        "tags_exclude": [],
+        "tag_mode": "any",
+        "notetype_ids": [],
+        "states": ["new", "learn", "review", "suspended"],
+        "search": ""
+    }
+}
