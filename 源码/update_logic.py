@@ -421,10 +421,15 @@ def fetch_latest_version(
     repo: str = UPDATE_REPO,
     branch: str = UPDATE_BRANCH,
     version: str = "",
+    fetch_json_fn: Optional[Callable] = None,
 ) -> str:
-    """取线上版本号；两条地址都拿不到就返回空串。"""
+    """取线上版本号；raw → Release 附件 → （默认联网时）GitHub API 里的 tag。
+
+    ``download`` 是测试注入点：一旦注入就不走 API 那条路，测试全程离线。
+    """
     if not repo_ready(repo):
         return ""
+    injected = download is not None
     download = download or (
         lambda url: fetch(url, timeout=VERSION_TIMEOUT, version=version)
     )
@@ -436,7 +441,39 @@ def fetch_latest_version(
             continue
         if text:
             return text
-    return ""
+    if injected and fetch_json_fn is None:
+        return ""
+    text = _version_from_api(repo, fetch_json_fn=fetch_json_fn, version=version)
+    if text:
+        _log(f"版本号改从 GitHub API 取到：{text}")
+    return text
+
+
+def _version_from_api(
+    repo: str = UPDATE_REPO,
+    *,
+    fetch_json_fn: Optional[Callable] = None,
+    version: str = "",
+    timeout: int = VERSION_TIMEOUT,
+) -> str:
+    """问 API「最新 Release 是哪个 tag」；拿到 ``v0.3.0`` 就返回 ``0.3.0``。
+
+    raw 那条路在实测网络里会被掐断（ECONNRESET），API 域名反而稳定，所以加这条兜底。
+    """
+    if not repo_ready(repo):
+        return ""
+    ask = fetch_json_fn or (
+        lambda url: fetch_json(url, timeout=timeout, version=version)
+    )
+    try:
+        import json
+
+        payload = json.loads(ask(release_api_url(repo)).decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        _log(f"问 API 要版本号失败：{exc}")
+        return ""
+    tag = str(payload.get("tag_name") or "").strip()
+    return tag[1:] if tag.lower().startswith("v") else tag
 
 
 def looks_like_package(data: bytes) -> bool:

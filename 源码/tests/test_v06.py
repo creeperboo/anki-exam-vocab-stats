@@ -441,6 +441,50 @@ class TestGithubApiFallback(unittest.TestCase):
         self.assertIn("U.VERSION_TIMEOUT", source)
         self.assertIn("U.host_reachable(", source)
 
+    def test_latest_version_falls_back_to_the_api_tag(self):
+        """raw 被掐断时，版本号改从 API 的最新 Release tag 取。"""
+        import json
+
+        def dead(url):
+            raise OSError("read ECONNRESET")
+
+        latest = U.fetch_latest_version(
+            download=dead,
+            fetch_json_fn=lambda url: json.dumps({"tag_name": "v0.9.9"}).encode(),
+        )
+        self.assertEqual(latest, "0.9.9")
+
+    def test_latest_version_with_injected_download_stays_offline(self):
+        """注入假下载器时（单测环境）绝不能偷偷走真网络。"""
+        real = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("不该真联网")
+        )
+        try:
+            got = U.fetch_latest_version(download=lambda url: (_ for _ in ()).throw(OSError("没网")))
+        finally:
+            urllib.request.urlopen = real
+        self.assertEqual(got, "")
+
+    def test_version_from_api_ignores_unusable_tag(self):
+        import json
+
+        self.assertEqual(
+            U._version_from_api(fetch_json_fn=lambda url: b"{}"), ""
+        )
+        self.assertEqual(
+            U._version_from_api(
+                fetch_json_fn=lambda url: json.dumps({"tag_name": "0.4.0"}).encode()
+            ),
+            "0.4.0",
+        )
+        self.assertEqual(
+            U._version_from_api(
+                fetch_json_fn=lambda url: (_ for _ in ()).throw(OSError("没网"))
+            ),
+            "",
+        )
+
 
 class TestHostReachable(unittest.TestCase):
     """先探一下主机通不通，别在死掉的地址上耗满超时。"""
