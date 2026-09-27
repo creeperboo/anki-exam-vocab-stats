@@ -283,6 +283,158 @@ class TestLocalZipInstall(unittest.TestCase):
         self.assertEqual(R.LocalResources.sha256_of(project_zip), expect)
 
 
+def release_json(names_to_ids: dict) -> bytes:
+    """造一份 GitHub /releases/latest 的 JSON（测试用，形状和真的一致）。"""
+    import json
+
+    assets = [
+        {
+            "name": name,
+            "url": U.asset_api_url(asset_id),
+            "browser_download_url": U.release_asset_url(name),
+        }
+        for name, asset_id in names_to_ids.items()
+    ]
+    return json.dumps({"tag_name": "v0.3.0", "assets": assets}).encode("utf-8")
+
+
+def package_bytes() -> bytes:
+    """造一个能被 looks_like_package 认下的最小分发包。"""
+    import io
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("manifest.json", '{"package": "exam_vocab_stats"}')
+        archive.writestr("__init__.py", "__version__ = '0.3.0'\n")
+        # 补点内容，超过 MIN_PACKAGE_BYTES，免得被当成半截包
+        archive.writestr("data/filler.bin", b"\x00" * 2048)
+    return buf.getvalue()
+
+
+class TestGithubApiFallback(unittest.TestCase):
+    """连不上 github.com:443 时，走 api.github.com 的附件接口当备用通道。"""
+
+    def setUp(self):
+        self.asked: list = []
+        self.payload = release_json({U.MATERIALS_ASSET: 4242})
+
+    def fake_json(self, url: str) -> bytes:
+        self.asked.append(url)
+        return self.payload
+
+    def test_api_asset_url_finds_the_asset(self):
+        url = U.api_asset_url(U.MATERIALS_ASSET, fetch_json_fn=self.fake_json)
+        self.assertEqual(url, U.asset_api_url(4242))
+        self.assertEqual(self.asked, [U.release_api_url()])
+
+    def test_api_asset_url_returns_empty_when_missing(self):
+        other = release_json({"something_else.bin": 1})
+        url = U.api_asset_url(U.MATERIALS_ASSET, fetch_json_fn=lambda url: other)
+        self.assertEqual(url, "")
+
+    def test_api_asset_url_returns_empty_on_network_failure(self):
+        def boom(url):
+            raise OSError("连不上 api.github.com")
+
+        self.assertEqual(U.api_asset_url(U.MATERIALS_ASSET, fetch_json_fn=boom), "")
+
+    def test_api_asset_url_returns_empty_for_bad_json(self):
+        self.assertEqual(
+            U.api_asset_url(U.MATERIALS_ASSET, fetch_json_fn=lambda url: b"<html>404"),
+            "",
+        )
+
+    def test_materials_urls_is_static_then_api_without_duplicates(self):
+        urls = U.materials_urls(fetch_json_fn=self.fake_json)
+        self.assertEqual(urls[0], U.materials_url())
+        self.assertEqual(urls[1], U.asset_api_url(4242))
+        self.assertEqual(len(urls), len(set(urls)), "地址不能重复")
+        self.assertTrue(urls[0].startswith("https://github.com/"))
+        self.assertTrue(urls[1].startswith("https://api.github.com/"))
+
+    def test_materials_urls_degrades_to_one_url_without_api(self):
+        urls = U.materials_urls(fetch_json_fn=lambda url: (_ for _ in ()).throw(OSError("没网")))
+        self.assertEqual(urls, [U.materials_url()])
+
+    def test_materials_urls_never_calls_the_network_in_tests(self):
+        """注入假 fetch_json 后，真网络入口一次都不许被碰。"""
+        real = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("不应该真联网")
+        )
+        try:
+            U.materials_urls(fetch_json_fn=self.fake_json)
+        finally:
+            urllib.request.urlopen = real
+
+    def test_package_urls_with_api_has_three_channels(self):
+        urls = U.package_urls_with_api(
+            fetch_json_fn=lambda url: release_json({U.UPDATE_ASSET: 4242})
+        )
+        self.assertEqual(
+            urls,
+            [
+                U.release_asset_url(U.UPDATE_ASSET),
+                U.raw_url(U.UPDATE_ASSET),
+                U.asset_api_url(4242),
+            ],
+        )
+
+    def test_fetch_package_falls_back_to_the_api_channel(self):
+        payload = package_bytes()
+        tried: list = []
+
+        def download(url: str) -> bytes:
+            tried.append(url)
+            if "api.github.com" not in url:
+                raise OSError("连不上 github.com:443")
+            return payload
+
+        got = U.fetch_package(
+            download=download,
+            fetch_json_fn=lambda url: release_json({U.UPDATE_ASSET: 4242}),
+        )
+        self.assertEqual(got, payload)
+        self.assertEqual(len(tried), 3, str(tried))
+        self.assertIn("api.github.com", tried[-1])
+
+    def test_fetch_package_reports_the_last_error_when_all_channels_fail(self):
+        def download(url: str) -> bytes:
+            raise OSError(f"挂了：{url}")
+
+        with self.assertRaises(Exception) as ctx:
+            U.fetch_package(download=download)
+        self.assertIn("挂了", str(ctx.exception))
+
+    def test_download_to_file_sends_the_accept_header(self):
+        payload = b"PK" + b"a" * 1024
+        seen: dict = {}
+
+        def fake(request, timeout=None):
+            seen["accept"] = request.headers.get("Accept")
+            seen["ua"] = request.headers.get("User-agent") or request.headers.get("User-Agent")
+            return FakeResumeResponse(payload, 0, status=200)
+
+        real = urllib.request.urlopen
+        urllib.request.urlopen = fake
+        try:
+            path = os.path.join(tempfile.mkdtemp(), "audio.zip")
+            wrote = U.download_to_file(
+                U.asset_api_url(4242), path, accept=U.BINARY_ACCEPT, version="0.3.0"
+            )
+        finally:
+            urllib.request.urlopen = real
+        self.assertEqual(wrote, len(payload))
+        self.assertEqual(seen["accept"], U.BINARY_ACCEPT)
+        self.assertIn("anki-exam-vocab-stats", seen["ua"] or "")
+
+    def test_source_wires_materials_download_to_the_url_list(self):
+        source = read_source("__init__.py")
+        self.assertIn("U.materials_urls(", source)
+        self.assertIn("accept=U.BINARY_ACCEPT", source)
+        self.assertIn("state[\"tried\"]", source)
+
+
 # ---------------------------------------------------------------- 打包清单
 
 

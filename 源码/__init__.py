@@ -1335,16 +1335,22 @@ class StatsDialog(QDialog):
         """下载音频包 → 校验 sha256 → 解压到用户配置目录。只有这一步联网。"""
         resources = get_resources(self.config, force=True)
         manifest = resources.manifest()
-        url = str(self.config.get("materials_source") or "").strip() or str(
-            manifest.get("url") or U.materials_url()
-        )
+        override = str(self.config.get("materials_source") or "").strip()
+        if override:
+            urls = [override]
+        else:
+            # 这里只用静态地址，不动网络（联网查 API 放在后台线程里做，别卡住界面）。
+            # 第一条是 Release 直链（github.com）；后台还会补一条 GitHub API 附件接口
+            # （api.github.com，专治「连不上 github.com:443」的网络）。
+            urls = [str(manifest.get("url") or U.materials_url())]
+        urls = [u for u in urls if u]
         expect = self._materials_expect_sha(resources)
-        if not url:
+        if not urls:
             showWarning("没有可用的音频包下载地址（插件里也没有 materials_manifest.json）。")
             return
         if not askUser(
             "将从网上（GitHub）下载音频包并解压到本机：\n"
-            f"{url}\n\n"
+            f"{urls[0]}\n\n"
             "大小约 208 MB，只下载一次；之后生成补漏卡全部离线。\n"
             "如果总是下载失败，可以改用「从本地 zip 文件安装…」。\n\n"
             "要现在开始吗？"
@@ -1378,20 +1384,44 @@ class StatsDialog(QDialog):
             import tempfile
 
             target = os.path.join(tempfile.gettempdir(), "exam_materials_audio.zip")
-            U.download_to_file(
-                url,
-                target,
-                timeout=U.MATERIALS_TIMEOUT,
-                retries=U.MATERIALS_RETRIES,
-                version=__version__,
-                progress=on_bytes,
-                resume=True,
-            )
-            if expect and resources.sha256_of(target) != expect:
-                raise RuntimeError("下载到的音频包校验不过（sha256 不一致），已放弃。")
-            return resources.install_media(
-                target, progress=self._media_progress_cb(progress, state, "正在解压音频文件")
-            )
+            tried = list(urls)
+            if not override:
+                # 后台才联网问 API 要「附件接口地址」，再补进候选列表
+                try:
+                    extra = [u for u in U.materials_urls(version=__version__) if u]
+                except Exception:  # noqa: BLE001
+                    extra = []
+                if extra:
+                    tried = extra
+            state["tried"] = tried
+            last_error = None
+            for url in tried:
+                try:
+                    U.download_to_file(
+                        url,
+                        target,
+                        timeout=U.MATERIALS_TIMEOUT,
+                        retries=U.MATERIALS_RETRIES,
+                        version=__version__,
+                        progress=on_bytes,
+                        resume=True,
+                        accept=U.BINARY_ACCEPT,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    continue
+                if expect and resources.sha256_of(target) != expect:
+                    last_error = RuntimeError(
+                        "下载到的音频包校验不过（sha256 不一致），已放弃。"
+                    )
+                    continue
+                return resources.install_media(
+                    target,
+                    progress=self._media_progress_cb(progress, state, "正在解压音频文件"),
+                )
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("音频包下载失败：没有可用的下载地址。")
 
         def done(future) -> None:
             state["closed"] = True
@@ -1399,7 +1429,7 @@ class StatsDialog(QDialog):
             try:
                 result = future.result()
             except Exception as exc:  # noqa: BLE001
-                showWarning(U.materials_failure_text([url], exc))
+                showWarning(U.materials_failure_text(state.get("tried") or urls, exc))
                 return
             self._finish_materials(result)
 

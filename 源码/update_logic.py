@@ -31,6 +31,14 @@ UPDATE_VERSION_FILE = "version.txt"
 MATERIALS_ASSET = "exam_materials_audio.zip"
 USER_AGENT_PREFIX = "anki-exam-vocab-stats"
 
+# GitHub API 通道。为什么需要它：有些网络（实测本机就是这样）连不上
+# github.com:443，但 api.github.com / objects.githubusercontent.com 是通的，
+# 于是 releases/latest/download/… 会直接超时。这条通道先问 API「附件的接口地址」，
+# 再带 Accept: application/octet-stream 去取，走的是另一个域名，能绕开这个坑。
+GITHUB_API = "https://api.github.com"
+BINARY_ACCEPT = "application/octet-stream"
+JSON_ACCEPT = "application/vnd.github+json"
+
 # 启动时最多一天查一次
 UPDATE_INTERVAL_SECONDS = 86400
 
@@ -100,6 +108,79 @@ def materials_url(repo: str = UPDATE_REPO) -> str:
     return release_asset_url(MATERIALS_ASSET, repo)
 
 
+def release_api_url(repo: str = UPDATE_REPO) -> str:
+    """最新 Release 的 API 地址。"""
+    return f"{GITHUB_API}/repos/{repo}/releases/latest"
+
+
+def asset_api_url(asset_id, repo: str = UPDATE_REPO) -> str:
+    """某个 Release 附件的 API 地址（要配 Accept: application/octet-stream 才吐二进制）。"""
+    return f"{GITHUB_API}/repos/{repo}/releases/assets/{asset_id}"
+
+
+def fetch_json(
+    url: str,
+    *,
+    timeout: int = PACKAGE_TIMEOUT,
+    version: str = "",
+) -> bytes:
+    """取一个 JSON 小文件（GitHub API）。"""
+    import urllib.request
+
+    user_agent = f"{USER_AGENT_PREFIX}/{version}" if version else USER_AGENT_PREFIX
+    request = urllib.request.Request(
+        url, headers={"User-Agent": user_agent, "Accept": JSON_ACCEPT}
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def api_asset_url(
+    name: str,
+    *,
+    fetch_json_fn: Optional[Callable] = None,
+    repo: str = UPDATE_REPO,
+    timeout: int = PACKAGE_TIMEOUT,
+    version: str = "",
+) -> str:
+    """问 GitHub API「最新 Release 里这个附件现在的接口地址是什么」。
+
+    拿不到（网络不通、还没有 Release、附件没上传完）就返回空串，调用方自己决定怎么办。
+    测试里注入 ``fetch_json_fn``，不联网。
+    """
+    if not repo_ready(repo):
+        return ""
+    ask = fetch_json_fn or (
+        lambda url: fetch_json(url, timeout=timeout, version=version)
+    )
+    try:
+        import json
+
+        payload = json.loads(ask(release_api_url(repo)).decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        _log(f"问 Release 附件接口失败：{exc}")
+        return ""
+    for asset in payload.get("assets") or []:
+        if str(asset.get("name") or "") == str(name):
+            return str(asset.get("url") or "")
+    return ""
+
+
+def materials_urls(
+    repo: str = UPDATE_REPO,
+    fetch_json_fn: Optional[Callable] = None,
+    version: str = "",
+) -> list:
+    """音频包的下载地址，按顺序试：Release 直链 → GitHub API 附件接口。"""
+    urls = [materials_url(repo)]
+    api = api_asset_url(
+        MATERIALS_ASSET, fetch_json_fn=fetch_json_fn, repo=repo, version=version
+    )
+    if api and api not in urls:
+        urls.append(api)
+    return urls
+
+
 def download_urls(
     name: str, repo: str = UPDATE_REPO, branch: str = UPDATE_BRANCH
 ) -> list:
@@ -121,6 +202,21 @@ def package_urls(
     if not repo_ready(repo):
         return []
     return [release_asset_url(asset, repo), raw_url(asset, repo, branch)]
+
+
+def package_urls_with_api(
+    asset: str = UPDATE_ASSET,
+    repo: str = UPDATE_REPO,
+    branch: str = UPDATE_BRANCH,
+    fetch_json_fn: Optional[Callable] = None,
+    version: str = "",
+) -> list:
+    """分发包的地址，在两条静态地址后面再补一条 GitHub API 通道。"""
+    urls = package_urls(asset, repo, branch)
+    api = api_asset_url(asset, fetch_json_fn=fetch_json_fn, repo=repo, version=version)
+    if api and api not in urls:
+        urls.append(api)
+    return urls
 
 
 def release_url(latest: str, repo: str = UPDATE_REPO) -> str:
@@ -145,15 +241,19 @@ def fetch(
     timeout: int = 10,
     retries: int = 2,
     version: str = "",
+    accept: str = "",
 ) -> bytes:
     """下载一个小文件；分块读 + 失败重试（raw 偶尔会卡住）。"""
     import urllib.request
 
     user_agent = f"{USER_AGENT_PREFIX}/{version}" if version else USER_AGENT_PREFIX
+    headers = {"User-Agent": user_agent}
+    if accept:
+        headers["Accept"] = accept
     last_error: Optional[BaseException] = None
     for attempt in range(max(0, retries) + 1):
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+            request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 chunks: list = []
                 while True:
@@ -181,17 +281,23 @@ def download_to_file(
     version: str = "",
     progress=None,
     resume: bool = False,
+    accept: str = "",
 ) -> int:
     """把大文件分块写到磁盘（音频包级别），返回写入的字节数。
 
     ``progress(done, total)`` 可选，``total`` 拿不到 Content-Length 时是 0。
     ``resume=True`` 时重试会带 ``Range: bytes=<已下载>-`` 续写同一个临时文件
     （断点续传）；所有重试都失败才把残留文件删掉，免得留下半截包被当成好包。
+    ``accept`` 用于 GitHub API 的附件接口（必须带 ``application/octet-stream``
+    才吐二进制而不是 JSON）。
     """
     import os
     import urllib.request
 
     user_agent = f"{USER_AGENT_PREFIX}/{version}" if version else USER_AGENT_PREFIX
+    base_headers = {"User-Agent": user_agent}
+    if accept:
+        base_headers["Accept"] = accept
     last_error: Optional[BaseException] = None
     for attempt in range(max(0, retries) + 1):
         start = 0
@@ -208,7 +314,7 @@ def download_to_file(
             except OSError:
                 pass
         done = start
-        headers = {"User-Agent": user_agent}
+        headers = dict(base_headers)
         if start:
             headers["Range"] = f"bytes={start}-"
         try:
@@ -298,8 +404,12 @@ def fetch_package(
     branch: str = UPDATE_BRANCH,
     asset: str = UPDATE_ASSET,
     version: str = "",
+    fetch_json_fn: Optional[Callable] = None,
 ) -> bytes:
-    """下载分发包；raw 挂了就换 Release 附件。两条都不行才报错。"""
+    """下载分发包；Release 直链挂了就换 raw，再不行走 GitHub API 附件接口。
+
+    API 那条路走的是 ``api.github.com``，专门绕开「连不上 github.com:443」的网络。
+    """
     if not repo_ready(repo):
         raise RuntimeError("没有配置更新仓库")
     download = download or (
@@ -308,10 +418,13 @@ def fetch_package(
             timeout=PACKAGE_TIMEOUT,
             retries=PACKAGE_RETRIES,
             version=version,
+            accept=BINARY_ACCEPT,
         )
     )
     last_error: Optional[BaseException] = None
-    for url in package_urls(asset, repo, branch):
+    for url in package_urls_with_api(
+        asset, repo, branch, fetch_json_fn=fetch_json_fn, version=version
+    ):
         try:
             data = download(url)
         except Exception as exc:
