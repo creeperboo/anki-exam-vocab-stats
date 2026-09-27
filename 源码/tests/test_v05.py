@@ -577,11 +577,12 @@ class TestBuilderSkipsThinCards(unittest.TestCase):
         self.assertEqual(drafts, [])
         self.assertIn("音频", skipped[0]["reason"])
 
-    def test_pending_word_is_not_built(self):
+    def test_pending_word_is_built_too(self):
+        """歧义词（待确认）在界面里也算未覆盖，所以默认一起做卡。"""
         rows = [{"key": "x", "language": "en", "code": "cet4", "reason": A.GAP_PENDING}]
         drafts, skipped = B.build_drafts(rows, FakeResources({"x": self.full()}))
-        self.assertEqual(drafts, [])
-        self.assertEqual(skipped[0]["reason"], A.GAP_PENDING)
+        self.assertEqual([d["key"] for d in drafts], ["x"])
+        self.assertEqual(skipped, [])
 
 
 class TestBuilderAudioGate(unittest.TestCase):

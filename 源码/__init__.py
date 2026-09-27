@@ -14,8 +14,10 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import sys
 import time
+import weakref
 from collections import defaultdict
 
 from aqt import gui_hooks, mw
@@ -58,6 +60,7 @@ try:
     from . import (
         analysis,
         builder as B,
+        cleanup as CL,
         hook_guard as HG,
         resources as RES,
         update_logic as U,
@@ -66,6 +69,7 @@ try:
 except ImportError:  # pragma: no cover
     import analysis
     import builder as B
+    import cleanup as CL
     import hook_guard as HG
     import resources as RES
     import update_logic as U
@@ -82,7 +86,7 @@ ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ADDON_DIR, "data")
 MENU_LABEL = "应试词汇覆盖统计…"
 # 必须与「源码/version.txt」一致（有测试盯着）；线上更新靠它比较新旧。
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 # 更新状态文件的目录名，和统计缓存同一个文件夹（都在用户配置目录里）
 USER_DIR_NAME = "exam_vocab_stats"
 
@@ -112,6 +116,10 @@ DEFAULTS = {
         "new_per_day": 0,
         "add_tags": True,
     },
+    # 补漏牌组自动清理：打开 Anki 后悄悄检查，已被词表覆盖的补漏卡删掉
+    # （已经进入学习/复习的永远保留）。删完可 Ctrl+Z 整组撤销。
+    "auto_cleanup": True,
+    "cleanup_keep_empty_decks": True,
     "scope": {
         "deck_ids": [],
         "include_subdecks": True,
@@ -771,6 +779,20 @@ class StatsDialog(QDialog):
         build_row.addWidget(self.build_tag_box)
         build_row.addStretch(1)
         box_layout.addLayout(build_row)
+
+        # —— 补漏牌组自动清理：已覆盖的补漏卡自动删掉（已开始学习的永远保留）
+        clean_row = QHBoxLayout()
+        self.cleanup_box = QCheckBox("自动清理已覆盖的补漏卡（打开 Anki 后检查；已开始学习的保留）")
+        self.cleanup_box.setChecked(bool(self.config.get("auto_cleanup", True)))
+        clean_row.addWidget(self.cleanup_box)
+        self.cleanup_button = QPushButton("立即检查并清理")
+        self.cleanup_button.clicked.connect(self.run_cleanup_now)
+        clean_row.addWidget(self.cleanup_button)
+        clean_row.addStretch(1)
+        box_layout.addLayout(clean_row)
+        self.cleanup_label = QLabel("")
+        self.cleanup_label.setWordWrap(True)
+        box_layout.addWidget(self.cleanup_label)
         layout.addWidget(box)
 
         buttons = QHBoxLayout()
@@ -1237,8 +1259,73 @@ class StatsDialog(QDialog):
         )
         if getattr(self, "update_label", None) is not None:
             self.update_label.setText(U.describe_state(_update_state(), __version__))
-        # 设置页里还挂着「素材库状态」那一行，一起刷一遍。
+        # 设置页里还挂着「素材库状态」「上次自动清理」那两行，一起刷一遍。
         self.render_materials()
+        self.render_cleanup()
+
+    def render_cleanup(self) -> None:
+        """设置页那行「上次自动清理」。"""
+        if getattr(self, "cleanup_label", None) is None:
+            return
+        try:
+            text = CL.cleanup_status_text(load_cleanup_log())
+        except Exception:  # noqa: BLE001
+            text = "自动清理状态读取失败（不影响统计）。"
+        self.cleanup_label.setText(
+            text
+            + "　补漏卡只要有一张进过学习/复习就永久保留；删掉的那批可以 Ctrl+Z 撤销。"
+        )
+
+    def run_cleanup_now(self) -> None:
+        """手动跑一次补漏牌组清理（和启动时自动跑的是同一段逻辑）。"""
+        config = dict(self.config)
+        config["auto_cleanup"] = bool(self.cleanup_box.isChecked())
+        self.config["auto_cleanup"] = config["auto_cleanup"]
+        progress = QProgressDialog(
+            "正在检查补漏牌组里有没有已被覆盖的词…\n（不改你现有的卡片；已开始学习的会保留）",
+            "",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle("清理补漏牌组")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.show()
+
+        def work():
+            return run_builder_cleanup(self.col, config)
+
+        def done(future):
+            progress.close()
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001
+                showWarning(f"清理出错：{exc}")
+                return
+            self.render_cleanup()
+            if result.get("error"):
+                showWarning("清理没跑完：" + str(result["error"]))
+                return
+            if not result.get("candidates"):
+                showInfo("补漏牌组里现在没有卡片，没什么可清理的。")
+                return
+            if not result.get("removed"):
+                showInfo(
+                    f"检查了 {result['candidates']} 张补漏卡，都还需要留着："
+                    f"其中 {result.get('kept_started', 0)} 张已经学过（永久保留），"
+                    "其余的词现在还没被覆盖。"
+                )
+                return
+            words = "、".join(result.get("words") or [])[:300]
+            showInfo(
+                f"已删掉 {result['removed']} 张已被覆盖的补漏卡（检查 {result['candidates']} 张）。\n"
+                + (f"涉及：{words}\n" if words else "")
+                + "已经学过/复习过的卡没动。Ctrl+Z 可以撤销这次清理。"
+            )
+
+        mw.taskman.run_in_background(work, done)
 
     # ---- 内置素材库
     def render_materials(self, describe: dict | None = None) -> None:
@@ -1582,6 +1669,7 @@ class StatsDialog(QDialog):
         defaults["new_per_day"] = int(self.build_new_box.value())
         defaults["add_tags"] = self.build_tag_box.isChecked()
         self.config["builder_defaults"] = defaults
+        self.config["auto_cleanup"] = bool(self.cleanup_box.isChecked())
         save_config(self.config)
         get_matchers(self.config, force=True)
         self.refresh(force=True)
@@ -1634,7 +1722,7 @@ class StatsDialog(QDialog):
         if choice == "uncovered":
             if targets:
                 self.tag_hint.setText(
-                    "将只给「真未覆盖」的词建卡："
+                    "将给界面显示「未覆盖」的词建卡（词表里没有的 + 歧义词）："
                     + "、".join(label for _l, _c, label in targets)
                     + "。素材库里已经有音频/释义/例句的词才建；「其实有卡、只是没认出来」的词不会重复制卡。"
                 )
@@ -1735,7 +1823,7 @@ class StatsDialog(QDialog):
             return
         rows = self.builder_rows(targets)
         if not rows:
-            showInfo("勾选的词表在当前范围里没有「真未覆盖」的词。")
+            showInfo("勾选的词表在当前范围里没有「未覆盖」的词。")
             return
         defaults = dict(DEFAULTS["builder_defaults"])
         defaults.update(self.config.get("builder_defaults") or {})
@@ -1743,6 +1831,8 @@ class StatsDialog(QDialog):
             "limit": int(defaults.get("limit") or 500),
             "add_tags": bool(defaults.get("add_tags", True)),
             "new_per_day": int(defaults.get("new_per_day") or 0),
+            # 建卡时用的统计范围：记进登记表，以后自动清理按同一个范围判定覆盖
+            "scope": dict(self.scope),
         }
         config = dict(self.config)
         progress = QProgressDialog(
@@ -1830,6 +1920,8 @@ class StatsDialog(QDialog):
             "落点：" + "、".join(report["deck_names"]) if report["deck_names"] else "",
             "新牌组的新卡上限是 0，检查满意后在牌组选项里自己放开。",
             "Ctrl+Z 可以把这一整组撤销。",
+            "以后这些词被别的牌库覆盖了，打开 Anki 时会自动把它们从补漏牌组里清掉"
+            "（已经开始学过的卡保留）。",
         ]
         if report["errors"]:
             lines.append("有 {} 处没成功：{}".format(len(report["errors"]), "；".join(report["errors"][:5])))
@@ -1922,6 +2014,22 @@ def apply_exam_tags(col, nids, tags, remove: bool = False) -> int:
 
 # 上一次「自定义撤销步骤」的经过，探针和排查都读它（界面上不显示）
 LAST_UNDO_INFO: dict = {}
+
+# 最近一次打开的统计窗口（弱引用）。补漏牌组自动清理跑完后，用它把设置页那行
+# 「上次自动清理」刷成最新状态，而不用把已经关掉的窗口一直留在内存里。
+LAST_STATS_DIALOG: dict = {"ref": None}
+
+
+def remember_stats_dialog(dialog) -> None:
+    try:
+        LAST_STATS_DIALOG["ref"] = weakref.ref(dialog)
+    except TypeError:  # pragma: no cover  理论上 QDialog 一定支持弱引用
+        LAST_STATS_DIALOG["ref"] = dialog
+
+
+def last_stats_dialog():
+    ref = LAST_STATS_DIALOG.get("ref")
+    return ref() if callable(ref) else ref
 
 
 def _note_request_class():
@@ -2082,7 +2190,8 @@ def write_builder_cards(col, drafts, options: dict | None = None) -> dict:
     LAST_UNDO_INFO.clear()
     model = ensure_builder_notetype(col)
     pending: list = []
-    for deck_name, group in B.group_by_deck(drafts).items():
+    groups = B.group_by_deck(drafts)
+    for deck_name, group in groups.items():
         try:
             did = col.decks.id_for_name(deck_name)
             created = False
@@ -2117,11 +2226,412 @@ def write_builder_cards(col, drafts, options: dict | None = None) -> dict:
             except Exception as exc:  # noqa: BLE001
                 report["errors"].append(f"{draft.get('key')}（{exc}）")
     _write_notes(col, pending, report)
+    # 记下「这个牌组是拿哪个范围建出来的」：以后自动清理要按同一个范围重算覆盖，
+    # 不能换个范围乱删（见 cleanup.py 文件头）。
+    try:
+        register_builder_decks(groups, options.get("scope"))
+    except Exception as exc:  # noqa: BLE001  登记失败不该让已经建好的卡片白费
+        print(f"[应试词汇覆盖统计] 记录补漏牌组范围失败（不影响卡片）：{exc}")
     try:
         mw.reset()
     except Exception:  # noqa: BLE001
         pass
     return report
+
+
+def register_builder_decks(groups: dict, scope: dict | None) -> dict:
+    """把这次生成的补漏牌组与「建卡时用的范围」写进登记表。
+
+    ``groups`` 是 ``builder.group_by_deck`` 的结果（牌组名 -> 草稿列表）。
+    登记表落在用户配置目录，不动 addons21。
+    """
+    if not groups:
+        return CL.empty_registry()
+    path = CL.registry_path(user_files_dir())
+    registry = CL.read_json(path) or CL.empty_registry()
+    for deck_name, group in groups.items():
+        first = group[0] if group else {}
+        words = [d.get("surface") or d.get("key") or "" for d in group]
+        registry = CL.register_deck(
+            registry,
+            deck_name,
+            code=first.get("code") or "",
+            language=first.get("language") or "en",
+            label=first.get("label") or "",
+            scope=scope,
+            words=words,
+            count=len(group),
+        )
+    CL.write_json(path, registry)
+    return registry
+
+
+def load_builder_registry() -> dict:
+    return CL.read_json(CL.registry_path(user_files_dir())) or CL.empty_registry()
+
+
+def load_cleanup_log() -> dict:
+    return CL.read_json(CL.log_path(user_files_dir()))
+
+
+def save_cleanup_log(log: dict) -> None:
+    CL.write_json(CL.log_path(user_files_dir()), log)
+
+
+def builder_deck_ids(col) -> list[int]:
+    """自带补漏牌组（``应试补漏`` 及其子牌组）的 int ID 列表。"""
+    out: list[int] = []
+    try:
+        decks = list(col.decks.all_names_and_ids())
+    except Exception:
+        decks = []
+    for deck in decks:
+        name = deck_name_text(getattr(deck, "name", ""))
+        if name == B.DECK_PREFIX or name.startswith(B.DECK_PREFIX + "::"):
+            did = analysis.as_int(getattr(deck, "id", None))
+            if did is not None and did not in out:
+                out.append(did)
+    return out
+
+
+def deck_name_text(name) -> str:
+    """牌组名统一成 ``::`` 分层写法。
+
+    集合数据库里牌组名其实用 ``\\x1f`` 做分隔符（``应试补漏\\x1f四级``），
+    Anki 的接口大多会转成 ``::``；这里两种都认，免得只读脚本或某个版本
+    的接口回传原始写法时匹配不上。
+    """
+    return str(name or "").replace("\x1f", "::")
+
+
+def builder_notetype_ids(col) -> list[int]:
+    """自带笔记类型「应试补漏卡」的 ID 列表（同名模型可能不止一个）。"""
+    out: list[int] = []
+    try:
+        models = list(col.models.all())
+    except Exception:
+        models = []
+    for model in models:
+        if (model or {}).get("name") != B.CARD_NOTETYPE_NAME:
+            continue
+        mid = analysis.as_int(model.get("id"))
+        if mid is not None and mid not in out:
+            out.append(mid)
+    return out
+
+
+_JA_CHAR_RE = re.compile(r"[\u3041-\u309f\u30a0-\u30ff\u4e00-\u9fff\u3400-\u4dbf]")
+
+
+def guess_language(text: str) -> str:
+    """认不出登记信息时的兜底：含假名/汉字就当日语，其余当英语。"""
+    return "ja" if _JA_CHAR_RE.search(text or "") else "en"
+
+
+def collect_cleanup_candidates(col) -> list[dict]:
+    """把补漏牌组里的笔记读出来：每条带词、读音、语言、牌组、全部卡片状态。
+
+    识别口径：**笔记类型是「应试补漏卡」**（不依赖牌组名，用户改过牌组名也认得出）
+    ＋ ``应试补漏`` 系列牌组里的笔记（含手动加进去的）。
+    """
+    notetype_ids = builder_notetype_ids(col)
+    deck_ids = builder_deck_ids(col)
+    if not notetype_ids and not deck_ids:
+        return []
+    clauses: list[str] = []
+    params: list = []
+    if notetype_ids:
+        clauses.append("n.mid in (%s)" % ",".join("?" * len(notetype_ids)))
+        params.extend(notetype_ids)
+    if deck_ids:
+        clauses.append("c.did in (%s)" % ",".join("?" * len(deck_ids)))
+        params.extend(deck_ids)
+    sql = (
+        "select n.id, n.mid, n.flds, c.type, c.did from notes n join cards c on c.nid = n.id"
+        " where " + " or ".join(clauses)
+    )
+    rows = col.db.all(sql, *params)
+
+    deck_names: dict[int, str] = {}
+    for did in deck_ids:
+        try:
+            deck_names[did] = deck_name_text(col.decks.name(did))
+        except Exception:
+            deck_names[did] = str(did)
+
+    registry = CL.registered_decks(load_builder_registry())
+    notes: dict = {}
+    for nid, mid, flds, ctype, did in rows:
+        note = notes.get(nid)
+        if note is None:
+            fields = (flds or "").split("\x1f")
+            word = V.clean_field(fields[0]) if fields else ""
+            reading = V.clean_field(fields[1]) if len(fields) > 1 else ""
+            note = {
+                "nid": analysis.as_int(nid),
+                "notetype_id": analysis.as_int(mid),
+                "word": word,
+                "reading": reading,
+                "decks": set(),
+                "card_types": [],
+            }
+            notes[nid] = note
+        deck_id = analysis.as_int(did)
+        if deck_id is not None:
+            note["decks"].add(deck_id)
+        note["card_types"].append(analysis.as_int(ctype) or 0)
+
+    out: list[dict] = []
+    for note in notes.values():
+        names = sorted(deck_names.get(d, str(d)) for d in note["decks"])
+        deck_name = ""
+        for name in names:
+            if name == B.DECK_PREFIX or name.startswith(B.DECK_PREFIX + "::"):
+                deck_name = name
+                break
+        if not deck_name and names:
+            deck_name = names[0]
+        entry = registry.get(deck_name) or {}
+        language = str(entry.get("language") or "") or guess_language(note["word"])
+        out.append(
+            {
+                "nid": note["nid"],
+                "word": note["word"],
+                "reading": note["reading"] if language == "ja" else "",
+                "language": language,
+                "deck": deck_name,
+                "card_types": note["card_types"],
+            }
+        )
+    return out
+
+
+def _cleanup_scope_for(deck_name: str, registry: dict) -> tuple[dict, str]:
+    """某个补漏牌组按哪个范围判定覆盖：优先建卡时的快照，缺了退回全集合。"""
+    entry = (registry or {}).get(deck_name) or {}
+    snapshot = entry.get("scope") or {}
+    if CL.scope_is_empty(snapshot):
+        return CL.scope_from_snapshot(None), "全集合（没有建卡时的范围快照）"
+    return CL.scope_from_snapshot(snapshot), "建卡时的范围"
+
+
+def _cleanup_summary(col, config: dict, matchers: dict, scope: dict, exclude_ids: list):
+    """按这个范围重算一份统计（永远排除补漏牌组自己）。"""
+    scoped = dict(scope)
+    scoped["deck_ids_exclude"] = list(exclude_ids)
+    scoped_config = dict(config)
+    scoped_config["source_dimension"] = "deck"
+    collected = analysis.collect_entries(
+        col, scoped, field_index_map(config), matchers
+    )
+    return analysis.summarize(col, collected, scoped_config, matchers)
+
+
+def run_builder_cleanup(col, config: dict, matchers: dict | None = None) -> dict:
+    """跑一次补漏牌组清理：判定 -> 删笔记（一个撤销步骤）-> 写日志。
+
+    不弹任何对话框（确认由界面负责），探针才能在无人值守下验证这一段。
+    """
+    matchers = matchers or get_matchers(config)
+    # 字段映射只在打开过统计窗后才写进配置。启动清理可能比那还早，这里补一次
+    # （只改内存里的 config，不落盘），否则范围一片空白、会把所有补漏卡判成未覆盖。
+    try:
+        ensure_field_map(col, config, matchers)
+    except Exception:  # noqa: BLE001  识别失败就当没映射，最多这次不删
+        pass
+    exclude_ids = builder_deck_ids(col)
+    registry = load_builder_registry()
+    try:
+        alive = [deck_name_text(deck.name) for deck in col.decks.all_names_and_ids()]
+    except Exception:
+        alive = []
+    registry, dropped = CL.prune_registry(registry, alive)
+    if dropped:
+        CL.write_json(CL.registry_path(user_files_dir()), registry)
+
+    started = time.time()
+    failure = ""
+    removed: list[int] = []
+    plan = {
+        "remove": [],
+        "keep": [],
+        "removed_words": [],
+        "counts": {},
+        "candidates": 0,
+        "decks": [],
+    }
+    scope_sources: set[str] = set()
+    try:
+        candidates = collect_cleanup_candidates(col)
+        buckets: dict = {}
+        for item in candidates:
+            buckets.setdefault(item.get("deck") or "", []).append(item)
+        resolver = CL.make_resolver(matchers)
+        coverage_cache: dict = {}
+        for deck_name, group in list(buckets.items()):
+            # 同一批候选用同一个范围判定；范围算一次就够（重复范围复用结果）
+            scope_key = json.dumps(
+                (registry.get(deck_name) or {}).get("scope") or {}, sort_keys=True
+            )
+            cached = coverage_cache.get(scope_key)
+            if cached is None:
+                scope, why = _cleanup_scope_for(deck_name, registry)
+                scope_sources.add(why)
+                summary = _cleanup_summary(col, config, matchers, scope, exclude_ids)
+                cached = CL.coverage_from_summary(summary)
+                coverage_cache[scope_key] = cached
+            part = CL.plan_cleanup(group, cached, resolver)
+            for key in ("remove", "keep"):
+                plan[key].extend(part[key])
+            plan["removed_words"].extend(part.get("removed_words") or [])
+            plan["decks"].extend(part["decks"])
+            for key, value in part["counts"].items():
+                plan["counts"][key] = plan["counts"].get(key, 0) + value
+            plan["candidates"] += part["candidates"]
+        if plan["remove"]:
+            removed = _remove_notes_with_undo(col, plan["remove"])
+        if not bool(config.get("cleanup_keep_empty_decks", True)):
+            _drop_empty_builder_decks(col, exclude_ids)
+    except Exception as exc:  # noqa: BLE001  清理失败只记日志，绝不影响用户用 Anki
+        failure = f"{type(exc).__name__}: {exc}"
+        print(f"[应试词汇覆盖统计] 自动清理失败（不影响使用）：{exc}")
+
+    counts = plan.get("counts") or {}
+    entry = {
+        "at": time.time(),
+        "seconds": round(time.time() - started, 2),
+        "candidates": int(plan.get("candidates") or 0),
+        "removed": len(removed),
+        "kept": len(plan.get("keep") or []),
+        "kept_started": int(counts.get(CL.KEEP_STARTED, 0)),
+        "kept_uncovered": int(counts.get(CL.KEEP_UNCOVERED, 0)),
+        "words": sorted(set(plan.get("removed_words") or []))[:200],
+        "decks": sorted(set(plan.get("decks") or [])),
+        "dropped_decks": list(dropped),
+        "scope": (
+            "、".join(sorted(scope_sources))
+            if scope_sources
+            else "全集合（没有建卡时的范围快照）"
+        ),
+        "error": failure,
+    }
+    log = CL.append_log(load_cleanup_log(), entry)
+    save_cleanup_log(log)
+    return {
+        "removed": len(removed),
+        "notes": [analysis.as_int(nid) for nid in removed],
+        "kept": entry["kept"],
+        "kept_started": entry["kept_started"],
+        "candidates": entry["candidates"],
+        "words": entry["words"],
+        "decks": entry["decks"],
+        "error": failure,
+        "status": CL.cleanup_status_text(log),
+    }
+
+
+def _remove_notes_with_undo(col, nids) -> list[int]:
+    """删笔记（卡片一起消失），整批包成一个自定义撤销步骤。"""
+    if not nids:
+        return []
+    token = _begin_undo(col, "清理已被覆盖的应试补漏卡")
+    done: list[int] = []
+    try:
+        remover = getattr(col, "remove_notes", None)
+        if callable(remover):
+            remover(list(nids))
+            done = list(nids)
+        else:  # pragma: no cover  只在不支持 remove_notes 的旧版上走到
+            for nid in list(nids):
+                col.remNotes([nid])
+                done.append(nid)
+    finally:
+        _finish_undo(col, token)
+    try:
+        col.save()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        mw.reset()
+    except Exception:  # noqa: BLE001
+        pass
+    return done
+
+
+def _drop_empty_builder_decks(col, deck_ids) -> None:
+    """清空后连牌组一起删（默认不这么做，配置里可以打开）。"""
+    for did in list(deck_ids):
+        try:
+            count = col.db.scalar("select count() from cards where did = ?", did) or 0
+        except Exception:
+            continue
+        if int(count) == 0:
+            try:
+                col.decks.remove([did])
+            except Exception:  # noqa: BLE001
+                pass
+
+
+_CLEANUP_STARTED = {"done": False}
+
+
+def maybe_cleanup_on_start() -> None:
+    """打开 Anki 后悄悄跑一次补漏牌组清理（不弹窗，只写日志）。"""
+    if _CLEANUP_STARTED.get("done"):
+        return
+    try:
+        config = load_config()
+    except Exception:  # noqa: BLE001
+        return
+    if not bool(config.get("auto_cleanup", True)):
+        return
+    col = getattr(mw, "col", None)
+    if col is None:
+        return
+    _CLEANUP_STARTED["done"] = True
+
+    def work():
+        return run_builder_cleanup(col, config)
+
+    def done(future):
+        try:
+            result = future.result()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[应试词汇覆盖统计] 自动清理没跑成（不影响使用）：{exc}")
+            return
+        if result.get("removed"):
+            print(
+                "[应试词汇覆盖统计] 自动清理：删掉 %d 张已被覆盖的补漏卡（Ctrl+Z 可撤销）"
+                % result["removed"]
+            )
+        window = last_stats_dialog()
+        if window is not None and getattr(window, "cleanup_label", None) is not None:
+            try:
+                window.cleanup_label.setText(result.get("status") or "")
+            except Exception:  # noqa: BLE001
+                pass
+
+    taskman = getattr(mw, "taskman", None)
+    if taskman is not None and hasattr(taskman, "run_in_background"):
+        taskman.run_in_background(work, done)
+        return
+    try:  # pragma: no cover  只在没有 taskman 的环境里走到
+        done(_Immediate(work()))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[应试词汇覆盖统计] 自动清理没跑成（不影响使用）：{exc}")
+
+
+class _Immediate:
+    """没有后台任务机制时的兜底 future。"""
+
+    def __init__(self, value=None, error=None) -> None:
+        self._value = value
+        self._error = error
+
+    def result(self):
+        if self._error is not None:
+            raise self._error
+        return self._value
 
 
 def _field_reason(cfg: dict) -> str:
@@ -2467,6 +2977,7 @@ def open_stats(scope_override: dict | None = None) -> None:
     if scope_override:
         scope.update(scope_override)
     dialog = StatsDialog(mw.col, config, scope, mw)
+    remember_stats_dialog(dialog)
     dialog.refresh()
     dialog.show()
     dialog.exec()
@@ -2684,9 +3195,17 @@ def maybe_check_update_on_start() -> None:
 
 
 def _on_profile_did_open(*_args) -> None:
-    """等界面稳下来再查，别跟启动抢资源。"""
+    """等界面稳下来再做自动检查，别跟启动抢资源。"""
+    # 换了用户配置也要重新检查一遍（同一个 Anki 进程里可能换过配置）
+    _CLEANUP_STARTED["done"] = False
     try:
         QTimer.singleShot(8000, maybe_check_update_on_start)
+    except Exception:
+        pass
+    # 补漏牌组自动清理放在更新检查之后（12 秒）：它是本地计算，不联网，
+    # 但也要等 Anki 把界面和集合都准备好再跑。
+    try:
+        QTimer.singleShot(12000, maybe_cleanup_on_start)
     except Exception:
         pass
 

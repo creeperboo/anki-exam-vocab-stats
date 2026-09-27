@@ -77,7 +77,9 @@ class _DB:
 
 class _Decks:
     def __init__(self, rows):
-        self._by_id = {int(did): name for did, name in rows}
+        # 库里的牌组名用 \x1f 分层，统一成 ::（Anki 接口的写法），
+        # 否则 children() 的前缀比较和「应试补漏::四级」这类判断都会失配。
+        self._by_id = {int(did): str(name or "").replace("\x1f", "::") for did, name in rows}
 
     def name(self, did):
         return self._by_id.get(int(did), str(did))

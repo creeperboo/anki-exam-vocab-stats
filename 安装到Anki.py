@@ -36,6 +36,7 @@ ADDON_FILES = [
     "resources.py",
     "update_logic.py",
     "hook_guard.py",
+    "cleanup.py",
     "version.txt",
     "操作指南.txt",
     "data/exam_index.json.gz",
@@ -73,12 +74,15 @@ SOURCE_EXTRA = [
     "工具/素材库构建记录.md",
     "工具/anki_probe.py",
     "工具/run_anki_probe.py",
+    "工具/补漏跳过清单.py",
+    "工具/补漏清理预演.py",
     "工具/真实集合抽查.py",
     "源码/tests/test_vocab_logic.py",
     "源码/tests/test_update_logic.py",
     "源码/tests/test_v03.py",
     "源码/tests/test_v05.py",
     "源码/tests/test_v06.py",
+    "源码/tests/test_v07.py",
     "_维护记录/当前状态.md",
 ]
 

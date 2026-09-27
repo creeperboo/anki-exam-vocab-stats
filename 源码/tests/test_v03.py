@@ -430,15 +430,23 @@ def row(key, code="cet4", language="en", reason=analysis.GAP_MISSING, **extra):
 
 
 class TestBuilder(unittest.TestCase):
-    def test_only_missing_reason_becomes_card(self):
+    def test_missing_and_pending_become_card(self):
+        """真未覆盖 + 歧义（待确认）都做卡；识别失败不做（会重复现有卡片）。"""
         rows = [
             row("abandon"),
             row("notaword", reason=analysis.GAP_UNRECOGNIZED),
             row("pending", reason=analysis.GAP_PENDING),
         ]
         drafts, skipped = B.build_drafts(rows, FakeResources())
+        self.assertEqual([d["key"] for d in drafts], ["abandon", "pending"])
+        self.assertEqual({s["reason"] for s in skipped}, {analysis.GAP_UNRECOGNIZED})
+
+    def test_pending_can_still_be_excluded(self):
+        """显式传 include_pending=False 时歧义词回到跳过清单（保留旧口径的开关）。"""
+        rows = [row("abandon"), row("pending", reason=analysis.GAP_PENDING)]
+        drafts, skipped = B.build_drafts(rows, FakeResources(), {"include_pending": False})
         self.assertEqual([d["key"] for d in drafts], ["abandon"])
-        self.assertEqual({s["reason"] for s in skipped}, {analysis.GAP_UNRECOGNIZED, analysis.GAP_PENDING})
+        self.assertEqual({s["reason"] for s in skipped}, {analysis.GAP_PENDING})
 
     def test_incomplete_material_is_skipped(self):
         """素材不全的词不进补漏队列：不出「有的有音频、有的没有」的半截卡片。"""

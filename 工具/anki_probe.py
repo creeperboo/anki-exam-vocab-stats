@@ -295,7 +295,7 @@ def step_import() -> None:
     # 更新机制：只做离线断言，探针内不触网。
     # 探针不点「检查更新」，只核对常量、地址形状和默认开关，避免跑到一半挂网络。
     ver = getattr(module, "__version__", "")
-    check("插件版本号 = 0.3.0", ver == "0.3.0", f"实际 {ver!r}")
+    check("插件版本号 = 0.3.1", ver == "0.3.1", f"实际 {ver!r}")
     U = getattr(module, "U", None)
     check("能拿到 update_logic 模块", U is not None)
     if U is not None:
@@ -1433,7 +1433,7 @@ def step_materials() -> None:
     # ---- 下载通道加固：github.com 被挡时改走 GitHub API 附件接口（不联网）------
     fake_release = json.dumps(
         {
-            "tag_name": "v0.3.0",
+            "tag_name": "v0.3.1",
             "assets": [
                 {"name": module.U.MATERIALS_ASSET, "url": module.U.asset_api_url(999999)}
             ],
@@ -1710,13 +1710,13 @@ def step_builder() -> None:
     ]
     drafts, skipped = builder.build_drafts(rows, FakeMaterial(audio), {"limit": 10})
     check(
-        "只有「真未覆盖」会变成卡片草稿",
-        [d["key"] for d in drafts] == ["abandon", "ability"],
+        "真未覆盖 + 歧义词都变成卡片草稿（界面两态都是未覆盖）",
+        [d["key"] for d in drafts] == ["abandon", "ability", "maybe"],
         str([d["key"] for d in drafts]),
     )
     check(
-        "识别失败 / 待确认进了跳过清单",
-        {s["key"] for s in skipped} == {"notarealword", "maybe"},
+        "只有识别失败进跳过清单（做卡只会重复现有卡片）",
+        {s["key"] for s in skipped} == {"notarealword"},
         str(skipped),
     )
     check(
@@ -1782,6 +1782,139 @@ def step_builder() -> None:
     record("builder", {"notes": report["notes"], "media": report["media"], "decks": report["deck_names"]})
 
     leftovers = [int(r[0]) for r in col.db.all("select id from notes where mid=?", int(model["id"]))]
+    if leftovers:
+        try:
+            col.remove_notes(leftovers)
+        except Exception:  # noqa: BLE001
+            pass
+    for name in {d["deck"] for d in drafts}:
+        try:
+            dead = col.decks.id_for_name(name)
+            if dead:
+                col.decks.remove([int(dead)])
+        except Exception:  # noqa: BLE001
+            pass
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def step_cleanup() -> None:
+    """补漏牌组自动清理：只删「已覆盖且从未学过」的补漏卡，整批一个撤销步骤。"""
+    module = evs()
+    builder = module.B
+    analysis = module.analysis
+    col = mw.col
+    config = module.load_config()
+    matchers = module.get_matchers(config)
+
+    tmp = tempfile.mkdtemp(prefix="evs_cleanup_")
+    audio = os.path.join(tmp, "evs_cleanup_audio.mp3")
+    with open(audio, "wb") as fh:
+        fh.write(b"ID3\x03\x00\x00\x00" + b"\x00" * 64)
+
+    # abandon / children / better 都在范围里被词表认出来（children→child、better→good/well），
+    # 食べる 是日语轴 N5 已覆盖，zzzzghost 谁都不认。故意造出「已覆盖 + 未学习」「已覆盖 + 复习」
+    # 「已覆盖 + 暂停的新卡」「未覆盖 + 未学习」四种，把清理规则一次钉死。
+    rows = [
+        {"key": "abandon", "language": "en", "code": "cet4", "label": "四级", "reason": analysis.GAP_MISSING},
+        {"key": "children", "language": "en", "code": "cet4", "label": "四级", "reason": analysis.GAP_MISSING},
+        {"key": "better", "language": "en", "code": "cet4", "label": "四级", "reason": analysis.GAP_MISSING},
+        {"key": "zzzzghost", "language": "en", "code": "cet4", "label": "四级", "reason": analysis.GAP_MISSING},
+        {"key": "食べる", "language": "ja", "code": "n5", "label": "N5", "reason": analysis.GAP_MISSING},
+    ]
+    drafts, _skipped = builder.build_drafts(rows, FakeMaterial(audio), {"limit": 20})
+    check("清理用例建满 5 条草稿", len(drafts) == 5, str([d["key"] for d in drafts]))
+
+    before_cards = cards_snapshot()
+    before_notes = notes_snapshot()
+    report = module.write_builder_cards(col, drafts, {"add_tags": True, "new_per_day": 0})
+    check("清理用例补漏卡落库", report["notes"] == 5, str(report))
+
+    model = col.models.by_name(builder.CARD_NOTETYPE_NAME)
+    mid = int(model["id"])
+    nid_by_word: dict[str, int] = {}
+    for nid, flds in col.db.all("select id, flds from notes where mid=?", mid):
+        nid_by_word[(flds or "").split("\x1f")[0]] = int(nid)
+    check("五条补漏笔记都读得到", len(nid_by_word) == 5, str(sorted(nid_by_word)))
+
+    # children 进复习（永远保留）；better 暂停仍是新卡（可删）；其余保持未学习。
+    set_state(nid_by_word["children"], "review")
+    set_state(nid_by_word["better"], "suspended")
+
+    # 判定范围永远排除补漏牌组自己，否则补漏卡会把自己算成已覆盖而瞬间全删。
+    exclude = module.builder_deck_ids(col)
+    check("补漏牌组识别到了（用于排除）", bool(exclude), str(exclude))
+    collected = analysis.collect_entries(
+        col, {"deck_ids": [], "deck_ids_exclude": exclude}, module.field_index_map(config), matchers
+    )
+    entry_ids = {int(e["note_id"]) for e in collected["entries"]}
+    check(
+        "补漏卡不参与覆盖率统计（被排除在判定范围外）",
+        not (entry_ids & set(nid_by_word.values())),
+        str(sorted(entry_ids & set(nid_by_word.values()))),
+    )
+
+    result = module.run_builder_cleanup(col, config, matchers)
+    record(
+        "cleanup",
+        {
+            "removed": result["removed"],
+            "kept": result["kept"],
+            "kept_started": result["kept_started"],
+            "candidates": result["candidates"],
+            "words": result["words"],
+            "error": result["error"],
+        },
+    )
+    check("清理没有任何报错", not result["error"], str(result["error"]))
+    check("清理只看到自己造的 5 条候选", result["candidates"] == 5, str(result["candidates"]))
+    check(
+        "删掉「已覆盖且从未学过」的 3 条（abandon / better / 食べる）",
+        sorted(result["words"]) == sorted(["abandon", "better", "食べる"]) and result["removed"] == 3,
+        f"{result['removed']} 条 {result['words']}",
+    )
+    check("「已复习」的 children 被保住", result["kept_started"] >= 1, str(result["kept_started"]))
+    left_words = {
+        (flds or "").split("\x1f")[0]
+        for (flds,) in col.db.all("select flds from notes where mid=?", mid)
+    }
+    check(
+        "剩下的是 children（已复习）和 zzzzghost（真未覆盖）",
+        left_words == {"children", "zzzzghost"},
+        str(sorted(left_words)),
+    )
+
+    log = module.load_cleanup_log()
+    check("清理写了日志且记下删了 3 条", bool(log.get("last")) and log["last"].get("removed") == 3, str(log.get("last")))
+
+    undo_info: dict = {}
+    try:
+        # 和打标签/建卡同样的坑：Anki 26 的撤销入口在 collection 上。
+        undo_info["before"] = repr(col.undo_status())
+        col.undo()
+        undo_info["after"] = repr(col.undo_status())
+    except Exception as exc:  # noqa: BLE001
+        undo_info["error"] = str(exc)
+    record("cleanup_undo", undo_info)
+    restored = col.db.scalar("select count() from notes where mid=?", mid)
+    check("撤销（等同 Ctrl+Z）一次把删掉的补漏卡全恢复", restored == 5, f"{undo_info} 还剩 {restored}")
+
+    after_cards = cards_snapshot()
+    touched = {
+        cid
+        for cid in set(before_cards) & set(after_cards)
+        if before_cards[cid] != after_cards[cid]
+    }
+    check("清理没动过任何原有卡片的排期/状态", not touched, str(sorted(touched)[:5]))
+    after_notes = notes_snapshot()
+    changed_notes = {
+        nid
+        for nid in set(before_notes) & set(after_notes)
+        if before_notes[nid] != after_notes[nid]
+    }
+    check("清理没动过任何原有笔记的字段", not changed_notes, str(sorted(changed_notes)[:5]))
+
+    # 收拾干净：把探针自己造的补漏卡与牌组删掉，别影响后面的只读快照比对。
+    leftovers = [int(r[0]) for r in col.db.all("select id from notes where mid=?", mid)]
     if leftovers:
         try:
             col.remove_notes(leftovers)
@@ -2067,6 +2200,18 @@ def step_ui() -> None:
         )
         check("设置页素材库状态行写了当前状态", bool(dialog.material_label.text()), dialog.material_label.text()[:60])
 
+        # 补漏牌组自动清理（本轮新功能）：勾选框 + 立即执行按钮 + 上次清理状态行
+        check("设置页有「自动清理已覆盖的补漏卡」勾选框", dialog.cleanup_box is not None)
+        check("自动清理默认是开着的", dialog.cleanup_box.isChecked())
+        check("设置页有「立即检查并清理」按钮", dialog.cleanup_button is not None)
+        check(
+            "清理按钮文案写明是检查并清理",
+            "清理" in dialog.cleanup_button.text(),
+            dialog.cleanup_button.text(),
+        )
+        check("设置页有上次清理状态行", dialog.cleanup_label is not None)
+        record("settings_cleanup_row", {"checked": dialog.cleanup_box.isChecked()})
+
         # 离屏画一遍，把 Qt6 的画笔 API（Donut / StackedBar / ProgressCell）真跑一遍
         dialog.tabs.setCurrentIndex(0)
         pixmap_all = dialog.grab()
@@ -2235,6 +2380,7 @@ STEPS: list[tuple[str, Callable[[], None], int]] = [
     ("detail_filter", step_detail_filter, 800),
     ("materials", step_materials, 800),
     ("builder", step_builder, 1600),
+    ("cleanup", step_cleanup, 1600),
     ("sources", step_sources, 1600),
     ("cache", step_cache, 1600),
     ("ui", step_ui, 2000),

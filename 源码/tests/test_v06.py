@@ -615,10 +615,13 @@ class TestSourceGuards(unittest.TestCase):
             self.assertIn(f'"{key}"', self.source, f"清理名单里应当有 {key}")
         self.assertIn("LEGACY_CONFIG_KEYS", self.source)
 
-    def test_version_is_still_0_3_0(self):
-        self.assertIn('__version__ = "0.3.0"', self.source)
+    def test_version_file_matches_code(self):
+        # 版本号跟着改动走（v0.3.1 起），这里只盯「两份必须一致」，
+        # 具体是哪个号由 test_v07 里那条钉住。
         with open(os.path.join(SRC, "version.txt"), "r", encoding="utf-8") as handle:
-            self.assertEqual(handle.read().strip(), "0.3.0")
+            version = handle.read().strip()
+        self.assertTrue(version, "源码/version.txt 不能是空的")
+        self.assertIn(f'__version__ = "{version}"', self.source)
 
     def test_manifest_mod_is_a_positive_int(self):
         import json

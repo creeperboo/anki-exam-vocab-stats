@@ -4,7 +4,9 @@
 写什么、去重与限量、确认框文案、导出清单。真正创建牌组 / 笔记类型 / 写媒体 /
 落笔记由 ``__init__.py`` 接线（那边才有 Anki 的 API）。
 
-默认口径（已和用户确认）：只处理当前明细筛选结果里的「真未覆盖」词；新建独立
+默认口径（已和用户确认）：处理当前明细筛选结果里的「未覆盖」词——真未覆盖 + 歧义
+待确认，两者界面都算未覆盖，所以都做卡；「识别失败」（词表里有、卡片也有，是我们
+的匹配没认出）不重复制卡。新建独立
 牌组 ``应试补漏::<词表>`` + 自带笔记类型「应试补漏卡」；中文释义优先；新牌组的
 新卡上限设为 0（检查完自己手动放开）；同时打 ``应试::<词表>`` 标签。
 """
@@ -39,8 +41,13 @@ CARD_FIELDS = (
 CARD_NOTETYPE_NAME = "应试补漏卡"
 DECK_PREFIX = "应试补漏"
 
-# 补漏牌组只补这一类词；原因常量在 analysis 里，取不到就用中文兜底
-DEFAULT_REASONS = (getattr(A, "GAP_MISSING", "真未覆盖"),)
+# 补漏牌组默认补这两类词；原因常量在 analysis 里，取不到就用中文兜底。
+# 「真未覆盖」＝词表里根本没有这个词；「待确认」＝歧义（界面也算未覆盖）。
+# 「识别失败」＝词表里有、卡片里也有，只是匹配没认出——做卡只会重复，仍然跳过。
+DEFAULT_REASONS = (
+    getattr(A, "GAP_MISSING", "真未覆盖"),
+    getattr(A, "GAP_PENDING", "待确认"),
+)
 
 # 默认的新卡上限：0 = 先不让 Anki 自动出新卡，用户检查完再手动放开
 DEFAULT_NEW_PER_DAY = 0
@@ -185,7 +192,9 @@ def build_drafts(rows, resources, options: dict | None = None) -> tuple[list[dic
     options = dict(options or {})
     limit = int(options.get("limit") or DEFAULT_LIMIT)
     reasons = set(options.get("reasons") or DEFAULT_REASONS)
-    allow_pending = bool(options.get("include_pending", False))
+    # 歧义词（待确认）默认一起制卡；显式传 include_pending=False 才排除
+    if options.get("include_pending") is False:
+        reasons.discard(getattr(A, "GAP_PENDING", "待确认"))
     wanted_codes = set(options.get("codes") or ())
 
     drafts: list[dict] = []
@@ -219,9 +228,6 @@ def build_drafts(rows, resources, options: dict | None = None) -> tuple[list[dic
             skipped.append({"key": "", "reason": "没有词元"})
             continue
         if reason and reason not in reasons:
-            skipped.append({"key": key, "reason": reason})
-            continue
-        if not allow_pending and reason and reason != "真未覆盖":
             skipped.append({"key": key, "reason": reason})
             continue
         if wanted_codes and code and code not in wanted_codes:
@@ -299,7 +305,7 @@ def plan_text(drafts, skipped, decks=None, media_count: int = 0) -> str:
     decks = decks or sorted({d.get("deck") for d in drafts if d.get("deck")})
     not_ready = [d for d in drafts if not d.get("audio_ready")]
     lines = [
-        f"将新增 {len(drafts)} 条笔记（只补「真未覆盖」的词）。",
+        f"将新增 {len(drafts)} 条笔记（只补界面显示「未覆盖」的词：词表里没有的 + 歧义词）。",
         f"新建/复用的牌组 {len(decks)} 个：{'、'.join(decks) if decks else '（无）'}",
         f"要写入的音频文件 {media_count or len([d for d in drafts if d.get('audio_path')])} 个。",
         "每条卡片都带：单词 / 音标·假名 / 中文释义 / 例句 / 例句译 / 音频（素材来自插件内置素材库）。",
@@ -307,7 +313,17 @@ def plan_text(drafts, skipped, decks=None, media_count: int = 0) -> str:
         "你检查完再手动放开。",
     ]
     if skipped:
-        lines.append(f"跳过 {len(skipped)} 个词（不是「真未覆盖」、重复，或素材不全）。")
+        # 跳过的原因分种类报出来：「识别失败」是词表里有、你卡片里也有、只是匹配
+        # 没认出（不重复制卡），和「素材不全」「超上限」是两码事。
+        kinds: dict = {}
+        for item in skipped:
+            name = str(item.get("reason") or "其他")
+            kinds[name] = kinds.get(name, 0) + 1
+        detail = "、".join(
+            f"{name} {count} 个"
+            for name, count in sorted(kinds.items(), key=lambda pair: (-pair[1], pair[0]))
+        )
+        lines.append(f"跳过 {len(skipped)} 个词：{detail}。")
     if not_ready:
         lines.append(
             f"其中 {len(not_ready)} 条还没把音频包解压到本机"

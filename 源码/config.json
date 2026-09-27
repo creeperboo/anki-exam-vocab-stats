@@ -19,6 +19,8 @@
         "new_per_day": 0,
         "add_tags": true
     },
+    "auto_cleanup": true,
+    "cleanup_keep_empty_decks": true,
     "scope": {
         "deck_ids": [],
         "include_subdecks": true,

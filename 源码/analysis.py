@@ -140,6 +140,20 @@ def nodeck_scope(scope: dict, col) -> tuple[str, list]:
         where.append(f"c.did in ({marks})")
         params.extend(deck_ids)
 
+    # 排除某些牌组（含子牌组）。补漏牌组自动清理会用它：判定「这个词现在是否
+    # 已被覆盖」时绝不能把补漏牌组自己算进去，否则补漏卡会自己证明自己已覆盖。
+    exclude_deck_ids = as_int_list(scope.get("deck_ids_exclude"))
+    if exclude_deck_ids:
+        expanded: list[int] = []
+        for did in exclude_deck_ids:
+            for child in deck_and_child_ids(col, did):
+                if child not in expanded:
+                    expanded.append(child)
+        if expanded:
+            marks = ",".join("?" * len(expanded))
+            where.append(f"c.did not in ({marks})")
+            params.extend(sorted(set(expanded)))
+
     notetype_ids = as_int_list(scope.get("notetype_ids"))
     if notetype_ids:
         marks = ",".join("?" * len(notetype_ids))
@@ -940,8 +954,9 @@ def uncovered_words(matchers: dict, summary: dict, language: str, code: str, lim
     """某个词表里有、但当前范围里没覆盖的词，并给出「原因」。
 
     原因三选一（见文件头的 GAP_* 常量）：真未覆盖 / 识别失败 / 待确认。
-    只有「真未覆盖」会被一键补漏制卡拿去用——另外两类是我们自己的匹配或词表
-    本身的问题，硬造成卡片只会重复现有内容。
+    一键补漏制卡默认拿走「真未覆盖」和「待确认」——这两类界面都显示成「未覆盖」。
+    「识别失败」（词表里有、卡片里也有，只是匹配没认出）不拿去制卡，否则只会
+    重复现有内容。
     """
     covered = covered_keys_for(summary, language, code)
     # 「其实已经有卡了、只是写法/词元不一样」的词要先排掉，否则会被误报成
