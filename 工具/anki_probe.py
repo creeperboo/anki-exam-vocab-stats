@@ -1430,6 +1430,46 @@ def step_materials() -> None:
         module.U.materials_url(),
     )
 
+    # ---- 下载通道加固：github.com 被挡时改走 GitHub API 附件接口（不联网）------
+    fake_release = json.dumps(
+        {
+            "tag_name": "v0.3.0",
+            "assets": [
+                {"name": module.U.MATERIALS_ASSET, "url": module.U.asset_api_url(999999)}
+            ],
+        }
+    ).encode("utf-8")
+    urls = module.U.materials_urls(fetch_json_fn=lambda url: fake_release)
+    record("materials_urls", {"urls": urls})
+    check(
+        "音频包有两级下载通道：Release 直链 + GitHub API 附件接口",
+        len(urls) == 2
+        and urls[0].startswith("https://github.com/")
+        and urls[1].startswith("https://api.github.com/"),
+        str(urls),
+    )
+
+    def dead_connect(addr, timeout):
+        raise OSError("timed out")
+
+    check(
+        "连不上的主机会被提前跳过（不再干等 60 秒超时）",
+        module.U.host_reachable(
+            "https://github.com/x/y.zip", connect=dead_connect, proxies={}
+        )
+        is False,
+    )
+
+    addon_dir = os.path.dirname(os.path.abspath(module.__file__))
+    with open(os.path.join(addon_dir, "__init__.py"), "r", encoding="utf-8") as handle:
+        init_src = handle.read()
+    check(
+        "已安装的 __init__.py：素材库下载会先走 API 通道并带 Accept 头",
+        "api_first" in init_src
+        and "accept=U.BINARY_ACCEPT" in init_src
+        and "U.host_reachable(" in init_src,
+    )
+
     # ---- 本地 zip 安装通道：临时造一个小包，真走一遍 install_media -----------
     installed_before = res.media_installed()
     check(

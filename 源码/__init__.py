@@ -1386,13 +1386,31 @@ class StatsDialog(QDialog):
             target = os.path.join(tempfile.gettempdir(), "exam_materials_audio.zip")
             tried = list(urls)
             if not override:
-                # 后台才联网问 API 要「附件接口地址」，再补进候选列表
+                # 后台才联网问 API 要「附件接口地址」，再补进候选列表。
+                # 顺序上把 API 通道提到最前：github.com 被挡的网络里，静态直链要等
+                # 60 秒超时 × 4 次才轮到这里，用户会以为卡死；API 通就先走 API。
                 try:
-                    extra = [u for u in U.materials_urls(version=__version__) if u]
+                    extra = [
+                        u
+                        for u in U.materials_urls(
+                            version=__version__, timeout=U.VERSION_TIMEOUT
+                        )
+                        if u
+                    ]
                 except Exception:  # noqa: BLE001
                     extra = []
                 if extra:
-                    tried = extra
+                    api_first = [u for u in extra if "api.github.com" in u]
+                    rest = [u for u in extra if u not in api_first]
+                    for url in urls:
+                        if url not in api_first and url not in rest:
+                            rest.append(url)
+                    tried = api_first + rest
+            # 先花几秒探一下主机通不通：被彻底挡掉的地址会干等满 60 秒超时，
+            # 四条地址排下来就是好几分钟。全都不通时保留原列表（好让报错说清试过谁）。
+            alive = [u for u in tried if U.host_reachable(u)]
+            if alive:
+                tried = alive
             state["tried"] = tried
             last_error = None
             for url in tried:

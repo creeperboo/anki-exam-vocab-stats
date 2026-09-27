@@ -434,6 +434,72 @@ class TestGithubApiFallback(unittest.TestCase):
         self.assertIn("accept=U.BINARY_ACCEPT", source)
         self.assertIn("state[\"tried\"]", source)
 
+    def test_source_puts_the_api_channel_first(self):
+        """github.com 被挡时静态直链要干等好几分钟，能走的 API 通道要先试。"""
+        source = read_source("__init__.py")
+        self.assertIn("api_first", source)
+        self.assertIn("U.VERSION_TIMEOUT", source)
+        self.assertIn("U.host_reachable(", source)
+
+
+class TestHostReachable(unittest.TestCase):
+    """先探一下主机通不通，别在死掉的地址上耗满超时。"""
+
+    def test_unreachable_host_is_false(self):
+        def connect(addr, timeout):
+            raise OSError("timed out")
+
+        self.assertFalse(
+            U.host_reachable("https://github.com/x/y.zip", connect=connect, proxies={})
+        )
+
+    def test_reachable_host_is_true_and_closed(self):
+        closed = {"n": 0}
+
+        class Conn:
+            def close(self):
+                closed["n"] += 1
+
+        seen = {}
+
+        def connect(addr, timeout):
+            seen["addr"] = addr
+            seen["timeout"] = timeout
+            return Conn()
+
+        self.assertTrue(
+            U.host_reachable("https://api.github.com/x", connect=connect, proxies={})
+        )
+        self.assertEqual(seen["addr"], ("api.github.com", 443))
+        self.assertEqual(closed["n"], 1, "探完要关掉连接")
+
+    def test_proxy_short_circuits_without_probing(self):
+        def connect(addr, timeout):
+            raise AssertionError("有代理时不该直连探测")
+
+        self.assertTrue(
+            U.host_reachable(
+                "https://github.com/x", connect=connect, proxies={"https": "http://127.0.0.1:1"}
+            )
+        )
+
+    def test_url_without_host_is_false(self):
+        self.assertFalse(U.host_reachable("", connect=lambda a, t: None, proxies={}))
+
+    def test_http_url_defaults_to_port_80(self):
+        seen = {}
+
+        class Conn:
+            def close(self):
+                pass
+
+        def connect(addr, timeout):
+            seen["addr"] = addr
+            return Conn()
+
+        U.host_reachable("http://example.com/a", connect=connect, proxies={})
+        self.assertEqual(seen["addr"], ("example.com", 80))
+
 
 # ---------------------------------------------------------------- 打包清单
 

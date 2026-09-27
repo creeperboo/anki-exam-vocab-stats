@@ -170,15 +170,71 @@ def materials_urls(
     repo: str = UPDATE_REPO,
     fetch_json_fn: Optional[Callable] = None,
     version: str = "",
+    timeout: int = PACKAGE_TIMEOUT,
 ) -> list:
-    """音频包的下载地址，按顺序试：Release 直链 → GitHub API 附件接口。"""
+    """音频包的下载地址：Release 直链 + GitHub API 附件接口。
+
+    返回顺序是「静态直链在前、API 在后」，方便单测钉住地址形状；界面上真正下载时
+    会把 API 通道提到前面（那条路在 github.com 被挡的网络里是唯一能走的）。
+    ``timeout`` 只作用于问 API 的那一次 JSON 请求，给短一点免得界面干等。
+    """
     urls = [materials_url(repo)]
     api = api_asset_url(
-        MATERIALS_ASSET, fetch_json_fn=fetch_json_fn, repo=repo, version=version
+        MATERIALS_ASSET,
+        fetch_json_fn=fetch_json_fn,
+        repo=repo,
+        timeout=timeout,
+        version=version,
     )
     if api and api not in urls:
         urls.append(api)
     return urls
+
+
+def host_reachable(
+    url: str,
+    *,
+    timeout: int = 4,
+    connect: Optional[Callable] = None,
+    proxies: Optional[dict] = None,
+) -> bool:
+    """主机能不能连上（只做 TCP 握手，不下载）。
+
+    用途很窄但很值钱：一个被彻底挡掉的主机（实测本机 github.com:443）每次尝试都要
+    干等满 60 秒超时，四次重试就是 4 分钟，用户会以为卡死。先花几秒探一下，
+    连不上就跳过它，直接走能通的那条。
+
+    有 HTTP(S) 代理时一律返回 True：那种网络下直连本来就不通，交给 urllib 自己走代理。
+    """
+    import socket
+    from urllib.parse import urlsplit
+
+    if proxies is None:
+        try:
+            import urllib.request
+
+            proxies = urllib.request.getproxies()
+        except Exception:  # noqa: BLE001
+            proxies = {}
+    if proxies:
+        return True
+
+    parts = urlsplit(url)
+    host = parts.hostname
+    if not host:
+        return False
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    opener = connect or socket.create_connection
+    try:
+        conn = opener((host, port), timeout)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"跳过连不上的主机：{host}:{port}（{exc}）")
+        return False
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return True
 
 
 def download_urls(
