@@ -1,0 +1,29 @@
+# 建索引用的原始词库（ecdict.csv 有 66MB），只在本机构建时用，不进仓库
+工具/下载/
+
+# 素材构建产物：音频包 208MB + 解压出来的 3 万个 mp3，只挂 GitHub Release，不进仓库
+# （GitHub 单文件 100MB 硬上限，git 仓库塞不下）
+工具/素材构建/
+
+# 打包产物（每次运行安装脚本会自动重新生成）
+应试词汇统计插件-源码.zip
+# 分发包本体 12.5MB，超过 git 单文件 5MB 的发布闸门：只挂 GitHub Release 附件，
+# 更新检查走 releases/latest/download 这条通道（raw 那条是可选兜底）
+exam_vocab_stats.ankiaddon
+# 补漏制卡用的轻量索引，只在构建期给 工具\构建素材库.py 读，插件运行期用不到
+# （运行期读的是 en_materials.json.gz / ja_materials.json.gz）
+源码/data/ecdict_lite.json.gz
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 本机运行数据与备份，不进仓库
+_备份/
+user_files/
+update.json
+
+# 系统杂物
+Thumbs.db
+desktop.ini
+.DS_Store
